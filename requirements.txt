@@ -1,0 +1,10 @@
+streamlit
+yfinance
+numpy
+pandas
+plotly
+scikit-learn
+hmmlearn
+arch
+cvxpy
+ecos
