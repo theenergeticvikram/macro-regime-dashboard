@@ -1,5 +1,5 @@
 # ==========================================================
-# 🏆 CROSS-ASSET REGIME-SWITCHING ALPHA DASHBOARD (CLOUD SAFE)
+# 🏆 CROSS-ASSET REGIME ENGINE (ULTRA STABLE VERSION)
 # ==========================================================
 
 import streamlit as st
@@ -10,7 +10,6 @@ import plotly.express as px
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from hmmlearn.hmm import GaussianHMM
-from arch import arch_model
 import cvxpy as cp
 import warnings
 
@@ -26,27 +25,43 @@ st.sidebar.title("⚙️ Configuration")
 
 period = st.sidebar.selectbox("Data Period", ["1y", "2y", "5y"], index=0)
 confidence = st.sidebar.slider("CVaR Confidence", 0.90, 0.99, 0.95)
-paths = st.sidebar.slider("Monte Carlo Paths", 5000, 30000, 15000, step=5000)
+paths = st.sidebar.slider("Monte Carlo Paths", 5000, 20000, 10000, step=5000)
 
 assets = ["SPY", "TLT", "UUP", "LQD", "GLD", "USO"]
 
 # ==========================================================
-# DATA LOADER (Cloud Safe)
+# DATA LOADER (Bulletproof)
 # ==========================================================
 
 @st.cache_data
 def load_data():
-    price_list = []
+
+    prices = pd.DataFrame()
 
     for ticker in assets:
-        df = yf.download(ticker, period=period, progress=False)
-        if not df.empty:
-            price_list.append(df["Close"].rename(ticker))
+        try:
+            df = yf.download(ticker, period=period, progress=False)
 
-    if len(price_list) < 3:
+            if df.empty:
+                continue
+
+            # Handle multi-index columns
+            if isinstance(df.columns, pd.MultiIndex):
+                close = df["Close"][ticker]
+            else:
+                close = df["Close"]
+
+            close = close.to_frame(name=ticker)
+            prices = pd.concat([prices, close], axis=1)
+
+        except:
+            continue
+
+    prices = prices.dropna()
+
+    if prices.shape[1] < 3:
         return None, None
 
-    prices = pd.concat(price_list, axis=1).dropna()
     returns = np.log(prices / prices.shift(1)).dropna()
 
     return prices, returns
@@ -55,7 +70,7 @@ def load_data():
 prices, returns = load_data()
 
 if returns is None or len(returns) < 100:
-    st.error("Market data download failed. Please refresh.")
+    st.error("Market data unavailable. Please refresh.")
     st.stop()
 
 returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
@@ -77,48 +92,27 @@ regime_probs = pd.DataFrame(
 )
 
 # ==========================================================
-# GARCH VOL FORECAST
-# ==========================================================
-
-vol_dict = {}
-
-for col in returns.columns:
-    try:
-        model = arch_model(returns[col] * 100, p=1, q=1)
-        res = model.fit(disp="off")
-        vol_dict[col] = res.conditional_volatility / 100
-    except:
-        vol_dict[col] = returns[col].rolling(20).std()
-
-garch_vol = pd.DataFrame(vol_dict)
-
-# ==========================================================
-# MONTE CARLO SIMULATION
+# MONTE CARLO + CVaR
 # ==========================================================
 
 mean = returns.mean().values
 cov = returns.cov().values
 
-simulated = np.random.multivariate_normal(mean, cov, (paths, 21))
-sim_returns = simulated.sum(axis=1)
-
-# ==========================================================
-# CVaR OPTIMIZATION
-# ==========================================================
+sim = np.random.multivariate_normal(mean, cov, (paths, 21))
+sim_returns = sim.sum(axis=1)
 
 n = len(returns.columns)
-
 w = cp.Variable(n)
 VaR = cp.Variable()
 z = cp.Variable(paths)
 
-portfolio_sim = sim_returns.reshape(-1, 1) @ w.reshape(1, -1)
+portfolio_loss = -sim_returns @ w
 
 constraints = [
     cp.sum(w) == 1,
     w >= 0,
     z >= 0,
-    z >= -portfolio_sim[:, 0] - VaR
+    z >= portfolio_loss - VaR
 ]
 
 CVaR = VaR + (1/(1-confidence)) * cp.sum(z)/paths
@@ -136,15 +130,11 @@ if weights is None:
     weights = np.repeat(1/n, n)
 
 # ==========================================================
-# PORTFOLIO BACKTEST
+# BACKTEST
 # ==========================================================
 
 portfolio_daily = returns @ weights
 cum_returns = np.exp(portfolio_daily.cumsum())
-
-# ==========================================================
-# RISK METRICS
-# ==========================================================
 
 total_return = cum_returns.iloc[-1] - 1
 sharpe = (portfolio_daily.mean() / portfolio_daily.std()) * np.sqrt(252)
@@ -155,66 +145,51 @@ max_dd = (cum_returns / cum_returns.cummax() - 1).min()
 # DASHBOARD
 # ==========================================================
 
-st.title("🏆 Cross-Asset Regime-Switching Alpha & Hedging Engine")
+st.title("🏆 Cross-Asset Regime-Switching Alpha Engine")
 
-# KPI Row
 col1, col2, col3, col4 = st.columns(4)
 
 col1.metric("Total Return", f"{total_return:.2%}")
 col2.metric("Sharpe Ratio", f"{sharpe:.2f}")
-col3.metric("Annual Volatility", f"{volatility:.2%}")
+col3.metric("Volatility", f"{volatility:.2%}")
 col4.metric("Max Drawdown", f"{max_dd:.2%}")
 
-# Performance
 st.subheader("📈 Portfolio Performance")
-fig_perf = px.line(cum_returns)
-st.plotly_chart(fig_perf, use_container_width=True)
+st.plotly_chart(px.line(cum_returns), use_container_width=True)
 
-# Regime
-st.subheader("📊 Regime Probability")
-fig_regime = px.area(regime_probs)
-st.plotly_chart(fig_regime, use_container_width=True)
+st.subheader("📊 Regime Probabilities")
+st.plotly_chart(px.area(regime_probs), use_container_width=True)
 
-# Weights
 st.subheader("🛡 Optimal CVaR Weights")
-fig_weights = px.bar(
-    x=returns.columns,
-    y=weights,
-    color=weights,
-    color_continuous_scale="Viridis"
+st.plotly_chart(
+    px.bar(
+        x=returns.columns,
+        y=weights,
+        color=weights,
+        color_continuous_scale="Viridis"
+    ),
+    use_container_width=True
 )
-st.plotly_chart(fig_weights, use_container_width=True)
 
-# Correlation
 st.subheader("🔥 Correlation Matrix")
-fig_corr = px.imshow(returns.corr(), text_auto=True, color_continuous_scale="RdBu")
-st.plotly_chart(fig_corr, use_container_width=True)
+st.plotly_chart(
+    px.imshow(returns.corr(), text_auto=True, color_continuous_scale="RdBu"),
+    use_container_width=True
+)
 
-# Hedge Frontier
 st.subheader("🛡 Hedge Efficiency vs SPY")
+
 hedge_ratios = np.linspace(0, 1, 20)
-vol_curve = []
+vol_curve = [(portfolio_daily - h * returns["SPY"]).std() for h in hedge_ratios]
 
-for h in hedge_ratios:
-    hedged = portfolio_daily - h * returns["SPY"]
-    vol_curve.append(hedged.std())
+st.plotly_chart(px.line(x=hedge_ratios, y=vol_curve), use_container_width=True)
 
-fig_frontier = px.line(x=hedge_ratios, y=vol_curve)
-st.plotly_chart(fig_frontier, use_container_width=True)
-
-# Stress Test
-st.subheader("⚠️ Stress Testing")
-shock = st.slider("Equity Shock (%)", -20, 0, -10)
-shock_return = portfolio_daily + (shock/100) * returns["SPY"]
-st.line_chart(np.exp(shock_return.cumsum()))
-
-# PCA Factor
 st.subheader("🧠 PCA Factor Exposure")
+
 pca = PCA(n_components=3)
 pca.fit(returns)
 
-fig_factor = px.bar(
-    x=returns.columns,
-    y=pca.components_[0]
+st.plotly_chart(
+    px.bar(x=returns.columns, y=pca.components_[0]),
+    use_container_width=True
 )
-st.plotly_chart(fig_factor, use_container_width=True)
