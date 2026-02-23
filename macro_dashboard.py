@@ -32,8 +32,24 @@ def load_data():
 
 data, returns = load_data()
 
+# Safety cleaning
+returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+
+if len(returns) < 50:
+    st.error("Not enough data to run HMM.")
+    st.stop()
+
+# Convert to numpy
+returns_np = returns.values
+
 hmm = GaussianHMM(n_components=3, covariance_type="full", n_iter=500)
-hmm.fit(returns)
+hmm.fit(returns_np)
+
+regime_probs = pd.DataFrame(
+    hmm.predict_proba(returns_np),
+    index=returns.index,
+    columns=["Risk-On", "Crisis", "Transition"]
+)
 
 regime_probs = pd.DataFrame(
     hmm.predict_proba(returns),
@@ -128,3 +144,4 @@ pca = PCA(n_components=3)
 pca.fit(returns)
 fig_factor = px.bar(x=assets, y=pca.components_[0])
 st.plotly_chart(fig_factor, use_container_width=True)
+
