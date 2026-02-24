@@ -1,6 +1,6 @@
 # ==========================================================
 # 🏛 INSTITUTIONAL CROSS-ASSET REGIME ALPHA ENGINE
-# JPM QDS-STYLE VERSION
+# FULL SAFE CLOUD VERSION
 # ==========================================================
 
 import streamlit as st
@@ -37,26 +37,29 @@ transaction_cost = st.sidebar.slider("Transaction Cost (bps)", 0, 50, 10)
 assets = ["SPY", "TLT", "UUP", "LQD", "GLD", "USO"]
 
 # ==========================================================
-# DATA LOADER
+# DATA LOADER (Cloud Safe)
 # ==========================================================
 
 @st.cache_data
 def load_data():
+
     prices = pd.DataFrame()
 
     for ticker in assets:
         try:
             df = yf.download(ticker, period=period, progress=False)
+
             if df.empty:
                 continue
 
-            if isinstance(df.columns, pd.MultiIndex):
-                close = df["Close"][ticker]
-            else:
-                close = df["Close"]
+            close = df["Close"]
 
-            close = close.to_frame(name=ticker)
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+
+            close.name = ticker
             prices = pd.concat([prices, close], axis=1)
+
         except:
             continue
 
@@ -71,8 +74,8 @@ def load_data():
 
 prices, returns = load_data()
 
-if returns is None or len(returns) < 200:
-    st.error("Market data unavailable. Please refresh.")
+if returns is None or len(returns) < 150:
+    st.error("Market data unavailable or insufficient.")
     st.stop()
 
 returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
@@ -94,7 +97,7 @@ regime_probs = pd.DataFrame(
 )
 
 # ==========================================================
-# CVaR OPTIMIZATION FUNCTION
+# CVaR OPTIMIZER
 # ==========================================================
 
 def optimize_cvar(train_data, confidence, paths):
@@ -135,7 +138,7 @@ def optimize_cvar(train_data, confidence, paths):
     return weights
 
 # ==========================================================
-# IN-SAMPLE OPTIMIZATION
+# IN-SAMPLE
 # ==========================================================
 
 weights_is = optimize_cvar(returns, confidence, paths)
@@ -173,6 +176,9 @@ def walk_forward_engine(returns, train_window, test_window, confidence, cost_bps
         weights_history.append(weights)
         prev_weights = weights
 
+    if len(oos_returns) == 0:
+        return pd.Series(dtype=float), [], []
+
     oos_returns = pd.Series(
         oos_returns,
         index=returns.index[train_window:train_window+len(oos_returns)]
@@ -189,13 +195,19 @@ oos_returns, weights_hist, turnover_hist = walk_forward_engine(
     transaction_cost
 )
 
-cum_oos = np.exp(oos_returns.cumsum())
+if len(oos_returns) > 0:
+    cum_oos = np.exp(oos_returns.cumsum())
+else:
+    cum_oos = pd.Series(dtype=float)
 
 # ==========================================================
-# METRICS FUNCTION
+# METRICS
 # ==========================================================
 
 def compute_metrics(series):
+
+    if len(series) < 2:
+        return 0, 0, 0
 
     sharpe = (series.mean() / series.std()) * np.sqrt(252)
     vol = series.std() * np.sqrt(252)
@@ -207,7 +219,7 @@ def compute_metrics(series):
 
 sharpe_is, vol_is, dd_is = compute_metrics(portfolio_is)
 sharpe_oos, vol_oos, dd_oos = compute_metrics(oos_returns)
-avg_turnover = np.mean(turnover_hist)
+avg_turnover = np.mean(turnover_hist) if len(turnover_hist) > 0 else 0
 
 # ==========================================================
 # DASHBOARD
@@ -215,7 +227,7 @@ avg_turnover = np.mean(turnover_hist)
 
 st.title("🏛 Institutional Cross-Asset Regime Alpha Engine")
 
-# In-Sample
+# In Sample
 st.subheader("📊 In-Sample Optimization")
 c1, c2, c3 = st.columns(3)
 c1.metric("Sharpe (IS)", f"{sharpe_is:.2f}")
@@ -223,56 +235,62 @@ c2.metric("Vol (IS)", f"{vol_is:.2%}")
 c3.metric("Max DD (IS)", f"{dd_is:.2%}")
 st.plotly_chart(px.line(cum_is), use_container_width=True)
 
-# OOS
-st.subheader("🏛 Walk-Forward Out-of-Sample Performance")
+# Out of Sample
+st.subheader("🏛 Walk-Forward OOS Performance")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Sharpe (OOS)", f"{sharpe_oos:.2f}")
 c2.metric("Vol (OOS)", f"{vol_oos:.2%}")
 c3.metric("Max DD (OOS)", f"{dd_oos:.2%}")
 c4.metric("Avg Turnover", f"{avg_turnover:.2f}")
-st.plotly_chart(px.line(cum_oos), use_container_width=True)
+
+if len(cum_oos) > 0:
+    st.plotly_chart(px.line(cum_oos), use_container_width=True)
+else:
+    st.warning("Not enough data for OOS backtest.")
 
 # ==========================================================
-# FACTOR REGRESSION (QDS STYLE)
+# SAFE FACTOR REGRESSION
 # ==========================================================
 
-st.subheader("📈 Factor Regression Analysis (vs SPY)")
+st.subheader("📈 Factor Regression Analysis")
 
-common_index = oos_returns.index.intersection(returns.index)
-y = oos_returns.loc[common_index]
-x = returns.loc[common_index]["SPY"]
+if "SPY" in returns.columns and len(oos_returns) > 30:
 
-X = sm.add_constant(x)
-model = sm.OLS(y, X).fit()
+    common_index = oos_returns.index.intersection(returns.index)
 
-alpha_daily = model.params["const"]
-beta = model.params["SPY"]
+    y = oos_returns.loc[common_index]
+    x = returns.loc[common_index, "SPY"]
 
-alpha_annual = alpha_daily * 252
-alpha_tstat = model.tvalues["const"]
-r_squared = model.rsquared
+    X = sm.add_constant(x)
+    model = sm.OLS(y, X).fit()
 
-tracking_error = (y - beta * x).std() * np.sqrt(252)
-info_ratio = alpha_annual / tracking_error if tracking_error != 0 else 0
+    alpha_annual = model.params["const"] * 252
+    beta = model.params["SPY"]
+    alpha_tstat = model.tvalues["const"]
+    r_squared = model.rsquared
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Annual Alpha", f"{alpha_annual:.2%}")
-c2.metric("Alpha t-stat", f"{alpha_tstat:.2f}")
-c3.metric("Beta vs SPY", f"{beta:.2f}")
-c4.metric("R²", f"{r_squared:.2f}")
-c5.metric("Information Ratio", f"{info_ratio:.2f}")
+    tracking_error = (y - beta * x).std() * np.sqrt(252)
+    info_ratio = alpha_annual / tracking_error if tracking_error != 0 else 0
 
-st.text(model.summary())
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Annual Alpha", f"{alpha_annual:.2%}")
+    c2.metric("Alpha t-stat", f"{alpha_tstat:.2f}")
+    c3.metric("Beta vs SPY", f"{beta:.2f}")
+    c4.metric("R²", f"{r_squared:.2f}")
+    c5.metric("Information Ratio", f"{info_ratio:.2f}")
+
+else:
+    st.warning("SPY data unavailable or insufficient for regression.")
 
 # ==========================================================
 # REGIME
 # ==========================================================
 
-st.subheader("📊 Regime Probabilities (HMM)")
+st.subheader("📊 Regime Probabilities")
 st.plotly_chart(px.area(regime_probs), use_container_width=True)
 
-# Current Weights
-st.subheader("🛡 Current CVaR Optimal Weights")
+# Weights
+st.subheader("🛡 Current Optimal Weights")
 st.plotly_chart(
     px.bar(x=returns.columns,
            y=weights_is,
