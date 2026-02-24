@@ -1,6 +1,6 @@
 # ==========================================================
-# 🏛 CROSS-ASSET REGIME ALPHA ENGINE
-# Institutional QDS Version (Walk-Forward + CVaR + HMM)
+# 🏛 INSTITUTIONAL CROSS-ASSET REGIME ALPHA ENGINE
+# JPM QDS-STYLE VERSION
 # ==========================================================
 
 import streamlit as st
@@ -11,6 +11,7 @@ import plotly.express as px
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from hmmlearn.hmm import GaussianHMM
+import statsmodels.api as sm
 import cvxpy as cp
 import warnings
 
@@ -191,7 +192,7 @@ oos_returns, weights_hist, turnover_hist = walk_forward_engine(
 cum_oos = np.exp(oos_returns.cumsum())
 
 # ==========================================================
-# METRICS
+# METRICS FUNCTION
 # ==========================================================
 
 def compute_metrics(series):
@@ -206,7 +207,6 @@ def compute_metrics(series):
 
 sharpe_is, vol_is, dd_is = compute_metrics(portfolio_is)
 sharpe_oos, vol_oos, dd_oos = compute_metrics(oos_returns)
-
 avg_turnover = np.mean(turnover_hist)
 
 # ==========================================================
@@ -215,37 +215,64 @@ avg_turnover = np.mean(turnover_hist)
 
 st.title("🏛 Institutional Cross-Asset Regime Alpha Engine")
 
-# ---- In-Sample Metrics ----
+# In-Sample
 st.subheader("📊 In-Sample Optimization")
+c1, c2, c3 = st.columns(3)
+c1.metric("Sharpe (IS)", f"{sharpe_is:.2f}")
+c2.metric("Vol (IS)", f"{vol_is:.2%}")
+c3.metric("Max DD (IS)", f"{dd_is:.2%}")
+st.plotly_chart(px.line(cum_is), use_container_width=True)
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Sharpe (IS)", f"{sharpe_is:.2f}")
-col2.metric("Vol (IS)", f"{vol_is:.2%}")
-col3.metric("Max DD (IS)", f"{dd_is:.2%}")
-
-st.plotly_chart(px.line(cum_is, title="In-Sample Cumulative Return"),
-                use_container_width=True)
-
-# ---- OOS Metrics ----
+# OOS
 st.subheader("🏛 Walk-Forward Out-of-Sample Performance")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Sharpe (OOS)", f"{sharpe_oos:.2f}")
+c2.metric("Vol (OOS)", f"{vol_oos:.2%}")
+c3.metric("Max DD (OOS)", f"{dd_oos:.2%}")
+c4.metric("Avg Turnover", f"{avg_turnover:.2f}")
+st.plotly_chart(px.line(cum_oos), use_container_width=True)
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Sharpe (OOS)", f"{sharpe_oos:.2f}")
-col2.metric("Vol (OOS)", f"{vol_oos:.2%}")
-col3.metric("Max DD (OOS)", f"{dd_oos:.2%}")
-col4.metric("Avg Turnover", f"{avg_turnover:.2f}")
+# ==========================================================
+# FACTOR REGRESSION (QDS STYLE)
+# ==========================================================
 
-st.plotly_chart(px.line(cum_oos, title="Out-of-Sample Cumulative Return"),
-                use_container_width=True)
+st.subheader("📈 Factor Regression Analysis (vs SPY)")
 
-# ---- Regime ----
+common_index = oos_returns.index.intersection(returns.index)
+y = oos_returns.loc[common_index]
+x = returns.loc[common_index]["SPY"]
+
+X = sm.add_constant(x)
+model = sm.OLS(y, X).fit()
+
+alpha_daily = model.params["const"]
+beta = model.params["SPY"]
+
+alpha_annual = alpha_daily * 252
+alpha_tstat = model.tvalues["const"]
+r_squared = model.rsquared
+
+tracking_error = (y - beta * x).std() * np.sqrt(252)
+info_ratio = alpha_annual / tracking_error if tracking_error != 0 else 0
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Annual Alpha", f"{alpha_annual:.2%}")
+c2.metric("Alpha t-stat", f"{alpha_tstat:.2f}")
+c3.metric("Beta vs SPY", f"{beta:.2f}")
+c4.metric("R²", f"{r_squared:.2f}")
+c5.metric("Information Ratio", f"{info_ratio:.2f}")
+
+st.text(model.summary())
+
+# ==========================================================
+# REGIME
+# ==========================================================
+
 st.subheader("📊 Regime Probabilities (HMM)")
-st.plotly_chart(px.area(regime_probs),
-                use_container_width=True)
+st.plotly_chart(px.area(regime_probs), use_container_width=True)
 
-# ---- Current Weights ----
+# Current Weights
 st.subheader("🛡 Current CVaR Optimal Weights")
-
 st.plotly_chart(
     px.bar(x=returns.columns,
            y=weights_is,
@@ -254,15 +281,11 @@ st.plotly_chart(
     use_container_width=True
 )
 
-# ---- PCA Factor Exposure ----
+# PCA
 st.subheader("🧠 PCA Factor Exposure")
-
 pca = PCA(n_components=3)
 pca.fit(returns)
-
 st.plotly_chart(
-    px.bar(x=returns.columns,
-           y=pca.components_[0],
-           title="First Principal Component"),
+    px.bar(x=returns.columns, y=pca.components_[0]),
     use_container_width=True
 )
