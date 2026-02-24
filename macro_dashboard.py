@@ -1,6 +1,6 @@
 # ==========================================================
-# 🏛 CROSS-ASSET REGIME ALPHA ENGINE
-# Bloomberg / JPM Institutional UI Version
+# 🏛 JPM GRC – QDS QUANT RESEARCH TERMINAL
+# Heavy Institutional Version (JD-Aligned)
 # ==========================================================
 
 import streamlit as st
@@ -13,253 +13,233 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from hmmlearn.hmm import GaussianHMM
 import statsmodels.api as sm
+import cvxpy as cp
+from arch import arch_model
 import warnings
 
 warnings.filterwarnings("ignore")
 st.set_page_config(layout="wide")
 
 # ==========================================================
-# 🔥 GLOBAL CSS (Institutional Dark Grid Theme)
+# CONFIGURATION PANEL
 # ==========================================================
 
-st.markdown("""
-<style>
+st.sidebar.title("Research Configuration")
 
-html, body, [class*="css"]  {
-    background-color: #0c111b;
-    color: white;
-    font-family: 'Segoe UI', sans-serif;
-}
-
-/* Grid Background */
-[data-testid="stAppViewContainer"] {
-    background-image:
-        linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
-    background-size: 40px 40px;
-}
-
-/* KPI Cards */
-.kpi-card {
-    background-color: #111827;
-    padding: 20px;
-    border-radius: 12px;
-    border: 1px solid rgba(255,255,255,0.08);
-    text-align: center;
-}
-
-.kpi-title {
-    font-size: 12px;
-    color: #9ca3af;
-    letter-spacing: 1px;
-}
-
-.kpi-value {
-    font-size: 26px;
-    font-weight: bold;
-    margin-top: 5px;
-}
-
-/* Section Boxes */
-.section-box {
-    background-color: #111827;
-    padding: 20px;
-    border-radius: 12px;
-    border: 1px solid rgba(255,255,255,0.08);
-}
-
-/* Regime Badge */
-.badge-green {
-    background-color: #064e3b;
-    color: #34d399;
-    padding: 4px 12px;
-    border-radius: 20px;
-}
-
-.badge-red {
-    background-color: #4c0519;
-    color: #f87171;
-    padding: 4px 12px;
-    border-radius: 20px;
-}
-
-</style>
-""", unsafe_allow_html=True)
-
-# ==========================================================
-# DATA
-# ==========================================================
+period = st.sidebar.selectbox("Data Period", ["2y","5y"], index=0)
+train_window = st.sidebar.slider("Training Window", 60, 252, 126)
+test_window = st.sidebar.slider("Testing Window", 21, 63, 21)
+confidence = st.sidebar.slider("CVaR Confidence", 0.90, 0.99, 0.95)
+tcost = st.sidebar.slider("Transaction Cost (bps)", 0, 50, 10)
 
 assets = ["SPY","TLT","GLD","UUP","LQD","USO"]
 
+# ==========================================================
+# DATA LAYER
+# ==========================================================
+
 @st.cache_data
 def load_data():
-    prices = yf.download(assets, period="2y", progress=False)["Close"]
+    prices = yf.download(assets, period=period, progress=False)["Close"]
     returns = np.log(prices / prices.shift(1)).dropna()
     return prices, returns
 
 prices, returns = load_data()
 
+if len(returns) < 200:
+    st.error("Insufficient data.")
+    st.stop()
+
 # ==========================================================
-# REGIME MODEL
+# MODULE 1 — SIGNAL ENGINE
+# Momentum + Vol Adjusted + Regime Filter
 # ==========================================================
 
+momentum = prices.pct_change(60).iloc[-1]
+vol = returns.rolling(60).std().iloc[-1]
+signal_raw = momentum / vol
+signal_z = (signal_raw - signal_raw.mean()) / signal_raw.std()
+
+# HMM Regime
 scaler = StandardScaler()
 scaled = scaler.fit_transform(returns)
-
 hmm = GaussianHMM(n_components=3, n_iter=300)
 hmm.fit(scaled)
-
 regime_probs = pd.DataFrame(
     hmm.predict_proba(scaled),
     index=returns.index,
     columns=["Risk-On","Crisis","Transition"]
 )
-
 current_regime = regime_probs.iloc[-1].idxmax()
-regime_strength = regime_probs.iloc[-1].max()
+
+signal = signal_z.copy()
+if current_regime == "Crisis":
+    signal = -signal
+
+signal_df = pd.DataFrame({
+    "Momentum": momentum,
+    "Vol": vol,
+    "Z-Score": signal_z,
+    "Regime Adj Signal": signal
+}).sort_values("Regime Adj Signal", ascending=False)
 
 # ==========================================================
-# PORTFOLIO METRICS
+# MODULE 2 — CVaR OPTIMIZATION
 # ==========================================================
 
-weights = np.repeat(1/len(assets), len(assets))
-portfolio = returns @ weights
-cum = np.exp(portfolio.cumsum())
+def optimize_cvar(data):
 
-sharpe = portfolio.mean()/portfolio.std()*np.sqrt(252)
-vol = portfolio.std()*np.sqrt(252)
-max_dd = (cum/cum.cummax()-1).min()
-ann_return = cum.iloc[-1]**(252/len(cum)) - 1
-sortino = portfolio.mean()/portfolio[portfolio<0].std()*np.sqrt(252)
-cvar_95 = np.percentile(portfolio,5)
+    mean = data.mean().values
+    cov = data.cov().values
+    sim = np.random.multivariate_normal(mean, cov, (5000, 21))
+    sim = sim.sum(axis=1)
 
-# Hedge Ratio
-beta = np.cov(portfolio, returns["SPY"])[0,1] / np.var(returns["SPY"])
+    n = data.shape[1]
+    w = cp.Variable(n)
+    VaR = cp.Variable()
+    z = cp.Variable(5000)
 
-# ==========================================================
-# HEADER BAR
-# ==========================================================
+    loss = -sim @ w
 
-st.markdown("## 🔵 CROSS-ASSET REGIME ALPHA ENGINE")
+    constraints = [
+        cp.sum(w)==1,
+        w>=0,
+        z>=0,
+        z>=loss-VaR
+    ]
 
-colh1,colh2,colh3 = st.columns([3,1,1])
+    cvar = VaR + (1/(1-confidence))*cp.sum(z)/5000
+    prob = cp.Problem(cp.Minimize(cvar), constraints)
 
-with colh1:
-    if current_regime == "Risk-On":
-        st.markdown(f"<span class='badge-green'>Regime: {current_regime} ({regime_strength:.0%})</span>", unsafe_allow_html=True)
-    else:
-        st.markdown(f"<span class='badge-red'>Regime: {current_regime} ({regime_strength:.0%})</span>", unsafe_allow_html=True)
+    try:
+        prob.solve(solver=cp.ECOS)
+    except:
+        prob.solve()
 
-with colh2:
-    st.markdown(f"MC Paths: 25,000")
+    if w.value is None:
+        return np.repeat(1/n,n)
 
-with colh3:
-    st.markdown(f"Hedge Ratio: {beta:.2f}")
-
-# ==========================================================
-# KPI ROW
-# ==========================================================
-
-cols = st.columns(7)
-
-kpis = [
-    ("Sharpe", f"{sharpe:.2f}"),
-    ("Sortino", f"{sortino:.2f}"),
-    ("Ann Return", f"{ann_return:.2%}"),
-    ("Ann Vol", f"{vol:.2%}"),
-    ("Max DD", f"{max_dd:.2%}"),
-    ("CVaR 95", f"{cvar_95:.2%}"),
-    ("Alpha", f"{ann_return - returns['SPY'].mean()*252:.2%}")
-]
-
-for col, (title,value) in zip(cols,kpis):
-    col.markdown(f"""
-    <div class="kpi-card">
-        <div class="kpi-title">{title}</div>
-        <div class="kpi-value">{value}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    return w.value
 
 # ==========================================================
-# REGIME + PERFORMANCE
+# MODULE 3 — WALK FORWARD BACKTEST
 # ==========================================================
 
-col1,col2 = st.columns(2)
+oos = []
+prev_w = np.repeat(1/len(assets), len(assets))
+turnover_list = []
 
-with col1:
-    st.markdown("### 🟢 REGIME PROBABILITIES")
-    fig1 = px.area(regime_probs,
-                   color_discrete_sequence=["#00d4ff","#ff4b4b","#ffaa00"])
-    fig1.update_layout(template="plotly_dark")
-    st.plotly_chart(fig1, use_container_width=True)
+for start in range(train_window, len(returns)-test_window, test_window):
 
-with col2:
-    st.markdown("### 🔵 ALPHA STRATEGY PERFORMANCE")
-    fig2 = px.line(cum)
-    fig2.update_layout(template="plotly_dark")
-    st.plotly_chart(fig2, use_container_width=True)
+    train = returns.iloc[start-train_window:start]
+    test = returns.iloc[start:start+test_window]
 
-# ==========================================================
-# SIGNAL TABLE
-# ==========================================================
+    w = optimize_cvar(train)
 
-st.markdown("### 🟢 CROSS-ASSET ALPHA SIGNALS")
+    turnover = np.sum(np.abs(w-prev_w))
+    cost = turnover*(tcost/10000)
 
-signals = pd.DataFrame({
-    "Asset": assets,
-    "Signal": np.round(np.random.uniform(-1,1,len(assets)),2),
-})
+    port = test @ w - cost
+    oos.extend(port)
 
-signals["Position"] = np.where(signals["Signal"]>0,"Long","Short")
-signals["Weight %"] = np.round(weights*100,2)
-signals["Regime"] = current_regime
+    turnover_list.append(turnover)
+    prev_w = w
 
-st.dataframe(signals, use_container_width=True)
+oos = pd.Series(oos, index=returns.index[train_window:train_window+len(oos)])
+cum_oos = np.exp(oos.cumsum())
 
 # ==========================================================
-# CORRELATION MATRIX
+# MODULE 4 — PERFORMANCE ANALYTICS
 # ==========================================================
 
-st.markdown("### 🌐 DCC CORRELATION MATRIX")
+def metrics(series):
+    sharpe = series.mean()/series.std()*np.sqrt(252)
+    cum = np.exp(series.cumsum())
+    dd = (cum/cum.cummax()-1).min()
+    hit = (series>0).mean()
+    return sharpe, dd, hit
 
-corr = returns.corr()
+sharpe, max_dd, hit_ratio = metrics(oos)
 
-fig_corr = px.imshow(
-    corr,
-    text_auto=True,
-    color_continuous_scale="RdBu",
-    aspect="auto"
-)
-
-fig_corr.update_layout(template="plotly_dark")
-st.plotly_chart(fig_corr, use_container_width=True)
+rolling_sharpe = oos.rolling(60).mean()/oos.rolling(60).std()*np.sqrt(252)
 
 # ==========================================================
-# RISK CONTRIBUTION
+# MODULE 5 — MULTI FACTOR REGRESSION
 # ==========================================================
 
-st.markdown("### 🔥 RISK CONTRIBUTION")
+factors = returns[["SPY","TLT","GLD"]]
+common = oos.index.intersection(factors.index)
 
+Y = oos.loc[common]
+X = sm.add_constant(factors.loc[common])
+model = sm.OLS(Y,X).fit()
+
+alpha = model.params["const"]*252
+tstat = model.tvalues["const"]
+r2 = model.rsquared
+
+# ==========================================================
+# MODULE 6 — RISK ATTRIBUTION
+# ==========================================================
+
+weights = optimize_cvar(returns)
 cov = returns.cov().values
 port_vol = np.sqrt(weights.T @ cov @ weights)
 marginal = cov @ weights / port_vol
 component = weights * marginal
 risk_contrib = component / port_vol
 
-fig_rc = px.bar(x=assets,y=risk_contrib,
-                color=risk_contrib,
-                color_continuous_scale="RdBu")
-fig_rc.update_layout(template="plotly_dark")
-st.plotly_chart(fig_rc, use_container_width=True)
-
 # ==========================================================
-# ROLLING BETA
+# MODULE 7 — GARCH VOL MODEL
 # ==========================================================
 
-st.markdown("### 📉 ROLLING BETA vs SPY")
+garch = arch_model(returns["SPY"]*100, p=1, q=1)
+res = garch.fit(disp="off")
+cond_vol = res.conditional_volatility/100
 
-rolling_beta = portfolio.rolling(60).cov(returns["SPY"]) / returns["SPY"].rolling(60).var()
-fig_beta = px.line(rolling_beta)
-fig_beta.update_layout(template="plotly_dark")
-st.plotly_chart(fig_beta, use_container_width=True)
+# ==========================================================
+# DASHBOARD OUTPUT
+# ==========================================================
+
+st.title("🏛 JPM GRC – QDS Quant Research Terminal")
+
+# Strategy Summary
+st.subheader("Strategy Summary")
+c1,c2,c3,c4 = st.columns(4)
+c1.metric("Sharpe (OOS)", f"{sharpe:.2f}")
+c2.metric("Max DD", f"{max_dd:.2%}")
+c3.metric("Hit Ratio", f"{hit_ratio:.2%}")
+c4.metric("Annual Alpha", f"{alpha:.2%}")
+
+# Signal Engine
+st.subheader("Trade Signal Engine")
+st.dataframe(signal_df)
+
+# Backtest
+st.subheader("Walk-Forward OOS Performance")
+st.plotly_chart(px.line(cum_oos), use_container_width=True)
+
+st.subheader("Rolling Sharpe")
+st.plotly_chart(px.line(rolling_sharpe), use_container_width=True)
+
+# Factor Attribution
+st.subheader("Multi-Factor Regression")
+st.write(model.summary())
+
+# Risk Contribution
+st.subheader("Risk Contribution")
+st.plotly_chart(px.bar(x=assets,y=risk_contrib), use_container_width=True)
+
+# GARCH Vol
+st.subheader("SPY Conditional Volatility (GARCH)")
+st.plotly_chart(px.line(cond_vol), use_container_width=True)
+
+# Correlation
+st.subheader("Cross-Asset Correlation")
+st.plotly_chart(px.imshow(returns.corr(), text_auto=True), use_container_width=True)
+
+# PCA
+st.subheader("PCA Factor Loading")
+pca = PCA(n_components=3)
+pca.fit(returns)
+st.plotly_chart(px.bar(x=assets,y=pca.components_[0]), use_container_width=True)
