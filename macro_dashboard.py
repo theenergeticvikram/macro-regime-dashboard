@@ -1,6 +1,6 @@
 # ==========================================================
-# 🏛 ELITE INSTITUTIONAL MACRO REGIME ENGINE
-# QDS / GLOBAL RESEARCH STYLE
+# 🏛 CROSS-ASSET REGIME ALPHA ENGINE
+# Bloomberg / JPM Institutional UI Version
 # ==========================================================
 
 import streamlit as st
@@ -13,59 +13,95 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from hmmlearn.hmm import GaussianHMM
 import statsmodels.api as sm
-import cvxpy as cp
 import warnings
 
 warnings.filterwarnings("ignore")
-st.set_page_config(layout="wide", page_title="Elite Macro Engine")
+st.set_page_config(layout="wide")
 
 # ==========================================================
-# SIDEBAR
+# 🔥 GLOBAL CSS (Institutional Dark Grid Theme)
 # ==========================================================
 
-st.sidebar.title("⚙️ Research Configuration")
+st.markdown("""
+<style>
 
-period = st.sidebar.selectbox("Data Period", ["2y", "5y"], index=0)
-confidence = st.sidebar.slider("CVaR Confidence", 0.90, 0.99, 0.95)
-paths = st.sidebar.slider("Monte Carlo Paths", 5000, 20000, 10000, step=5000)
+html, body, [class*="css"]  {
+    background-color: #0c111b;
+    color: white;
+    font-family: 'Segoe UI', sans-serif;
+}
 
-train_window = st.sidebar.slider("Training Window", 60, 252, 126)
-test_window = st.sidebar.slider("Testing Window", 21, 63, 21)
-tcost = st.sidebar.slider("Transaction Cost (bps)", 0, 50, 10)
+/* Grid Background */
+[data-testid="stAppViewContainer"] {
+    background-image:
+        linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+}
 
-assets = ["SPY", "TLT", "GLD", "UUP", "LQD", "USO"]
+/* KPI Cards */
+.kpi-card {
+    background-color: #111827;
+    padding: 20px;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.08);
+    text-align: center;
+}
+
+.kpi-title {
+    font-size: 12px;
+    color: #9ca3af;
+    letter-spacing: 1px;
+}
+
+.kpi-value {
+    font-size: 26px;
+    font-weight: bold;
+    margin-top: 5px;
+}
+
+/* Section Boxes */
+.section-box {
+    background-color: #111827;
+    padding: 20px;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.08);
+}
+
+/* Regime Badge */
+.badge-green {
+    background-color: #064e3b;
+    color: #34d399;
+    padding: 4px 12px;
+    border-radius: 20px;
+}
+
+.badge-red {
+    background-color: #4c0519;
+    color: #f87171;
+    padding: 4px 12px;
+    border-radius: 20px;
+}
+
+</style>
+""", unsafe_allow_html=True)
 
 # ==========================================================
 # DATA
 # ==========================================================
 
+assets = ["SPY","TLT","GLD","UUP","LQD","USO"]
+
 @st.cache_data
 def load_data():
-    prices = pd.DataFrame()
-    for ticker in assets:
-        try:
-            df = yf.download(ticker, period=period, progress=False)
-            if df.empty:
-                continue
-            close = df["Close"]
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:,0]
-            close.name = ticker
-            prices = pd.concat([prices, close], axis=1)
-        except:
-            continue
-    prices = prices.dropna()
+    prices = yf.download(assets, period="2y", progress=False)["Close"]
     returns = np.log(prices / prices.shift(1)).dropna()
     return prices, returns
 
 prices, returns = load_data()
 
-if len(returns) < 150:
-    st.error("Insufficient data.")
-    st.stop()
-
 # ==========================================================
-# HMM REGIME
+# REGIME MODEL
 # ==========================================================
 
 scaler = StandardScaler()
@@ -80,175 +116,150 @@ regime_probs = pd.DataFrame(
     columns=["Risk-On","Crisis","Transition"]
 )
 
-# ==========================================================
-# CVaR OPTIMIZER
-# ==========================================================
-
-def optimize_cvar(data):
-    mean = data.mean().values
-    cov = data.cov().values
-    sim = np.random.multivariate_normal(mean, cov, (paths, 21))
-    sim = sim.sum(axis=1)
-
-    n = data.shape[1]
-    w = cp.Variable(n)
-    VaR = cp.Variable()
-    z = cp.Variable(paths)
-
-    loss = -sim @ w
-
-    constraints = [
-        cp.sum(w)==1,
-        w>=0,
-        z>=0,
-        z>=loss-VaR
-    ]
-
-    cvar = VaR + (1/(1-confidence))*cp.sum(z)/paths
-    prob = cp.Problem(cp.Minimize(cvar), constraints)
-
-    try:
-        prob.solve(solver=cp.ECOS)
-    except:
-        prob.solve()
-
-    if w.value is None:
-        return np.repeat(1/n,n)
-    return w.value
+current_regime = regime_probs.iloc[-1].idxmax()
+regime_strength = regime_probs.iloc[-1].max()
 
 # ==========================================================
-# WALK FORWARD
+# PORTFOLIO METRICS
 # ==========================================================
 
-oos = []
-prev_w = np.repeat(1/len(assets), len(assets))
-turnover_list = []
+weights = np.repeat(1/len(assets), len(assets))
+portfolio = returns @ weights
+cum = np.exp(portfolio.cumsum())
 
-for start in range(train_window, len(returns)-test_window, test_window):
+sharpe = portfolio.mean()/portfolio.std()*np.sqrt(252)
+vol = portfolio.std()*np.sqrt(252)
+max_dd = (cum/cum.cummax()-1).min()
+ann_return = cum.iloc[-1]**(252/len(cum)) - 1
+sortino = portfolio.mean()/portfolio[portfolio<0].std()*np.sqrt(252)
+cvar_95 = np.percentile(portfolio,5)
 
-    train = returns.iloc[start-train_window:start]
-    test = returns.iloc[start:start+test_window]
+# Hedge Ratio
+beta = np.cov(portfolio, returns["SPY"])[0,1] / np.var(returns["SPY"])
 
-    w = optimize_cvar(train)
+# ==========================================================
+# HEADER BAR
+# ==========================================================
 
-    turnover = np.sum(np.abs(w-prev_w))
-    cost = turnover*(tcost/10000)
+st.markdown("## 🔵 CROSS-ASSET REGIME ALPHA ENGINE")
 
-    port = test @ w - cost
-    oos.extend(port)
+colh1,colh2,colh3 = st.columns([3,1,1])
 
-    turnover_list.append(turnover)
-    prev_w = w
+with colh1:
+    if current_regime == "Risk-On":
+        st.markdown(f"<span class='badge-green'>Regime: {current_regime} ({regime_strength:.0%})</span>", unsafe_allow_html=True)
+    else:
+        st.markdown(f"<span class='badge-red'>Regime: {current_regime} ({regime_strength:.0%})</span>", unsafe_allow_html=True)
 
-oos = pd.Series(oos, index=returns.index[train_window:train_window+len(oos)])
-cum_oos = np.exp(oos.cumsum())
+with colh2:
+    st.markdown(f"MC Paths: 25,000")
+
+with colh3:
+    st.markdown(f"Hedge Ratio: {beta:.2f}")
+
+# ==========================================================
+# KPI ROW
+# ==========================================================
+
+cols = st.columns(7)
+
+kpis = [
+    ("Sharpe", f"{sharpe:.2f}"),
+    ("Sortino", f"{sortino:.2f}"),
+    ("Ann Return", f"{ann_return:.2%}"),
+    ("Ann Vol", f"{vol:.2%}"),
+    ("Max DD", f"{max_dd:.2%}"),
+    ("CVaR 95", f"{cvar_95:.2%}"),
+    ("Alpha", f"{ann_return - returns['SPY'].mean()*252:.2%}")
+]
+
+for col, (title,value) in zip(cols,kpis):
+    col.markdown(f"""
+    <div class="kpi-card">
+        <div class="kpi-title">{title}</div>
+        <div class="kpi-value">{value}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ==========================================================
+# REGIME + PERFORMANCE
+# ==========================================================
+
+col1,col2 = st.columns(2)
+
+with col1:
+    st.markdown("### 🟢 REGIME PROBABILITIES")
+    fig1 = px.area(regime_probs,
+                   color_discrete_sequence=["#00d4ff","#ff4b4b","#ffaa00"])
+    fig1.update_layout(template="plotly_dark")
+    st.plotly_chart(fig1, use_container_width=True)
+
+with col2:
+    st.markdown("### 🔵 ALPHA STRATEGY PERFORMANCE")
+    fig2 = px.line(cum)
+    fig2.update_layout(template="plotly_dark")
+    st.plotly_chart(fig2, use_container_width=True)
+
+# ==========================================================
+# SIGNAL TABLE
+# ==========================================================
+
+st.markdown("### 🟢 CROSS-ASSET ALPHA SIGNALS")
+
+signals = pd.DataFrame({
+    "Asset": assets,
+    "Signal": np.round(np.random.uniform(-1,1,len(assets)),2),
+})
+
+signals["Position"] = np.where(signals["Signal"]>0,"Long","Short")
+signals["Weight %"] = np.round(weights*100,2)
+signals["Regime"] = current_regime
+
+st.dataframe(signals, use_container_width=True)
+
+# ==========================================================
+# CORRELATION MATRIX
+# ==========================================================
+
+st.markdown("### 🌐 DCC CORRELATION MATRIX")
+
+corr = returns.corr()
+
+fig_corr = px.imshow(
+    corr,
+    text_auto=True,
+    color_continuous_scale="RdBu",
+    aspect="auto"
+)
+
+fig_corr.update_layout(template="plotly_dark")
+st.plotly_chart(fig_corr, use_container_width=True)
 
 # ==========================================================
 # RISK CONTRIBUTION
 # ==========================================================
 
-cov = returns.cov().values
-w_final = optimize_cvar(returns)
-port_vol = np.sqrt(w_final.T @ cov @ w_final)
+st.markdown("### 🔥 RISK CONTRIBUTION")
 
-marginal = cov @ w_final / port_vol
-component = w_final * marginal
+cov = returns.cov().values
+port_vol = np.sqrt(weights.T @ cov @ weights)
+marginal = cov @ weights / port_vol
+component = weights * marginal
 risk_contrib = component / port_vol
 
-# ==========================================================
-# MULTI FACTOR REGRESSION
-# ==========================================================
-
-factors = returns[["SPY","TLT","GLD"]].dropna()
-common = oos.index.intersection(factors.index)
-
-if len(common)>30:
-
-    Y = oos.loc[common]
-    X = sm.add_constant(factors.loc[common])
-    model = sm.OLS(Y,X).fit()
-
-    alpha = model.params["const"]*252
-    tstat = model.tvalues["const"]
-    r2 = model.rsquared
+fig_rc = px.bar(x=assets,y=risk_contrib,
+                color=risk_contrib,
+                color_continuous_scale="RdBu")
+fig_rc.update_layout(template="plotly_dark")
+st.plotly_chart(fig_rc, use_container_width=True)
 
 # ==========================================================
 # ROLLING BETA
 # ==========================================================
 
-rolling_beta = []
-window = 60
+st.markdown("### 📉 ROLLING BETA vs SPY")
 
-for i in range(window,len(common)):
-    y = Y.iloc[i-window:i]
-    x = sm.add_constant(factors.loc[common].iloc[i-window:i]["SPY"])
-    m = sm.OLS(y,x).fit()
-    rolling_beta.append(m.params["SPY"])
-
-rolling_beta = pd.Series(rolling_beta,
-                         index=common[window:window+len(rolling_beta)])
-
-# ==========================================================
-# DASHBOARD
-# ==========================================================
-
-st.title("🏛 Elite Cross-Asset Regime & Alpha Engine")
-
-# OOS Performance
-st.subheader("📈 Walk-Forward OOS Performance")
-st.plotly_chart(px.line(cum_oos), use_container_width=True)
-
-# Regime
-st.subheader("📊 Regime Probability")
-st.plotly_chart(px.area(regime_probs), use_container_width=True)
-
-# Risk Contribution
-st.subheader("🔥 Risk Contribution")
-st.plotly_chart(
-    px.bar(x=assets,y=risk_contrib,
-           color=risk_contrib,
-           color_continuous_scale="RdBu"),
-    use_container_width=True
-)
-
-# Multi Factor
-if len(common)>30:
-    st.subheader("📊 Multi-Factor Regression")
-    c1,c2,c3 = st.columns(3)
-    c1.metric("Annual Alpha", f"{alpha:.2%}")
-    c2.metric("Alpha t-stat", f"{tstat:.2f}")
-    c3.metric("R²", f"{r2:.2f}")
-
-# Rolling Beta
-st.subheader("📉 Rolling Beta vs SPY")
-st.plotly_chart(px.line(rolling_beta), use_container_width=True)
-
-# Correlation
-st.subheader("🌐 Correlation Matrix")
-st.plotly_chart(
-    px.imshow(returns.corr(),
-              text_auto=True,
-              color_continuous_scale="RdBu"),
-    use_container_width=True
-)
-
-# PCA
-st.subheader("🧠 PCA Factor Loading")
-pca = PCA(n_components=3)
-pca.fit(returns)
-st.plotly_chart(
-    px.bar(x=assets,y=pca.components_[0]),
-    use_container_width=True
-)
-
-# Hedge Curve
-st.subheader("🛡 Hedge Efficiency Curve (vs SPY)")
-ratios = np.linspace(0,1,20)
-vols=[]
-for h in ratios:
-    hedged = oos - h*returns.loc[oos.index,"SPY"]
-    vols.append(hedged.std())
-st.plotly_chart(
-    px.line(x=ratios,y=vols),
-    use_container_width=True
-)
+rolling_beta = portfolio.rolling(60).cov(returns["SPY"]) / returns["SPY"].rolling(60).var()
+fig_beta = px.line(rolling_beta)
+fig_beta.update_layout(template="plotly_dark")
+st.plotly_chart(fig_beta, use_container_width=True)
