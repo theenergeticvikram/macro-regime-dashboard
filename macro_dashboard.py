@@ -1,6 +1,6 @@
 # ==========================================================
-# 🏛 JPM GRC – QDS QUANT RESEARCH TERMINAL
-# Heavy Institutional Version (JD-Aligned)
+# 🏛 JPM GRC – QDS FULL RESEARCH PLATFORM
+# Trade Ideas | Backtesting | Hedging | Derivatives | Index
 # ==========================================================
 
 import streamlit as st
@@ -15,16 +15,17 @@ from hmmlearn.hmm import GaussianHMM
 import statsmodels.api as sm
 import cvxpy as cp
 from arch import arch_model
+from scipy.stats import norm
 import warnings
 
 warnings.filterwarnings("ignore")
 st.set_page_config(layout="wide")
 
 # ==========================================================
-# CONFIGURATION PANEL
+# CONFIGURATION
 # ==========================================================
 
-st.sidebar.title("Research Configuration")
+st.sidebar.title("QDS Research Configuration")
 
 period = st.sidebar.selectbox("Data Period", ["2y","5y"], index=0)
 train_window = st.sidebar.slider("Training Window", 60, 252, 126)
@@ -35,7 +36,7 @@ tcost = st.sidebar.slider("Transaction Cost (bps)", 0, 50, 10)
 assets = ["SPY","TLT","GLD","UUP","LQD","USO"]
 
 # ==========================================================
-# DATA LAYER
+# DATA
 # ==========================================================
 
 @st.cache_data
@@ -60,16 +61,17 @@ vol = returns.rolling(60).std().iloc[-1]
 signal_raw = momentum / vol
 signal_z = (signal_raw - signal_raw.mean()) / signal_raw.std()
 
-# HMM Regime
 scaler = StandardScaler()
 scaled = scaler.fit_transform(returns)
 hmm = GaussianHMM(n_components=3, n_iter=300)
 hmm.fit(scaled)
+
 regime_probs = pd.DataFrame(
     hmm.predict_proba(scaled),
     index=returns.index,
     columns=["Risk-On","Crisis","Transition"]
 )
+
 current_regime = regime_probs.iloc[-1].idxmax()
 
 signal = signal_z.copy()
@@ -77,20 +79,21 @@ if current_regime == "Crisis":
     signal = -signal
 
 signal_df = pd.DataFrame({
-    "Momentum": momentum,
-    "Vol": vol,
+    "Momentum(60d)": momentum,
+    "Vol(60d)": vol,
     "Z-Score": signal_z,
     "Regime Adj Signal": signal
 }).sort_values("Regime Adj Signal", ascending=False)
 
 # ==========================================================
-# MODULE 2 — CVaR OPTIMIZATION
+# MODULE 2 — CVaR OPTIMIZER
 # ==========================================================
 
 def optimize_cvar(data):
 
     mean = data.mean().values
     cov = data.cov().values
+
     sim = np.random.multivariate_normal(mean, cov, (5000, 21))
     sim = sim.sum(axis=1)
 
@@ -122,7 +125,7 @@ def optimize_cvar(data):
     return w.value
 
 # ==========================================================
-# MODULE 3 — WALK FORWARD BACKTEST
+# MODULE 3 — WALK-FORWARD BACKTEST
 # ==========================================================
 
 oos = []
@@ -160,7 +163,6 @@ def metrics(series):
     return sharpe, dd, hit
 
 sharpe, max_dd, hit_ratio = metrics(oos)
-
 rolling_sharpe = oos.rolling(60).mean()/oos.rolling(60).std()*np.sqrt(252)
 
 # ==========================================================
@@ -179,7 +181,7 @@ tstat = model.tvalues["const"]
 r2 = model.rsquared
 
 # ==========================================================
-# MODULE 6 — RISK ATTRIBUTION
+# MODULE 6 — RISK CONTRIBUTION
 # ==========================================================
 
 weights = optimize_cvar(returns)
@@ -198,10 +200,38 @@ res = garch.fit(disp="off")
 cond_vol = res.conditional_volatility/100
 
 # ==========================================================
+# MODULE 8 — BLACK-SCHOLES OPTION PRICING
+# ==========================================================
+
+def black_scholes(S,K,T,r,sigma,option="call"):
+    d1 = (np.log(S/K)+(r+0.5*sigma**2)*T)/(sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    if option=="call":
+        return S*norm.cdf(d1)-K*np.exp(-r*T)*norm.cdf(d2)
+    else:
+        return K*np.exp(-r*T)*norm.cdf(-d2)-S*norm.cdf(-d1)
+
+S = prices["SPY"].iloc[-1]
+sigma = cond_vol.iloc[-1]
+option_price = black_scholes(S, S*1.05, 0.5, 0.03, sigma)
+
+# ==========================================================
+# MODULE 9 — INDEX INCLUSION SIMULATION
+# ==========================================================
+
+market_caps = prices.iloc[-1] * np.random.uniform(1e6,1e7,len(assets))
+index_rank = pd.DataFrame({
+    "Asset": assets,
+    "MarketCap Proxy": market_caps
+}).sort_values("MarketCap Proxy", ascending=False)
+
+top3 = index_rank.head(3)
+
+# ==========================================================
 # DASHBOARD OUTPUT
 # ==========================================================
 
-st.title("🏛 JPM GRC – QDS Quant Research Terminal")
+st.title("🏛 JPM GRC – QDS Full Research Platform")
 
 # Strategy Summary
 st.subheader("Strategy Summary")
@@ -211,7 +241,7 @@ c2.metric("Max DD", f"{max_dd:.2%}")
 c3.metric("Hit Ratio", f"{hit_ratio:.2%}")
 c4.metric("Annual Alpha", f"{alpha:.2%}")
 
-# Signal Engine
+# Trade Signals
 st.subheader("Trade Signal Engine")
 st.dataframe(signal_df)
 
@@ -230,9 +260,17 @@ st.write(model.summary())
 st.subheader("Risk Contribution")
 st.plotly_chart(px.bar(x=assets,y=risk_contrib), use_container_width=True)
 
-# GARCH Vol
+# GARCH
 st.subheader("SPY Conditional Volatility (GARCH)")
 st.plotly_chart(px.line(cond_vol), use_container_width=True)
+
+# Option Pricing
+st.subheader("Black-Scholes Option Pricing (SPY 5% OTM, 6m)")
+st.metric("Call Price", f"${option_price:.2f}")
+
+# Index Simulation
+st.subheader("Index Inclusion Simulation (Top 3 by MarketCap Proxy)")
+st.dataframe(top3)
 
 # Correlation
 st.subheader("Cross-Asset Correlation")
